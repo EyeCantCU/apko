@@ -437,8 +437,9 @@ type SBOM struct {
 }
 
 type Layering struct {
-	Strategy string `json:"strategy,omitempty" yaml:"strategy,omitempty"`
-	Budget   int    `json:"budget,omitempty" yaml:"budget,omitempty"`
+	Strategy     string `json:"strategy,omitempty" yaml:"strategy,omitempty"`
+	Budget       int    `json:"budget,omitempty" yaml:"budget,omitempty"`
+	Distribution string `json:"distribution,omitempty" yaml:"distribution,omitempty"`
 }
 
 type AdditionalCertificateEntry struct {

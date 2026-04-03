@@ -20,15 +20,14 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"hash/fnv"
 	"io"
-	"maps"
 	"os"
 	"path"
 	"slices"
 
 	"chainguard.dev/apko/pkg/apk/apk"
 	apkfs "chainguard.dev/apko/pkg/apk/fs"
-
 	"github.com/chainguard-dev/clog"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 )
@@ -36,8 +35,23 @@ import (
 func (bc *Context) buildLayers(ctx context.Context) ([]v1.Layer, error) {
 	log := clog.FromContext(ctx)
 
-	if strategy := bc.ic.Layering.Strategy; strategy != "origin" {
+	strategy := bc.ic.Layering.Strategy
+	switch strategy {
+	case "origin", "vendored":
+		log.Infof("using %s layering strategy", strategy)
+	default:
 		return nil, fmt.Errorf("unrecognized layering strategy %q", strategy)
+	}
+
+	distribution := bc.ic.Layering.Distribution
+	if distribution == "" {
+		distribution = "balanced"
+	}
+	switch distribution {
+	case "balanced", "stable":
+		log.Infof("using %s distribution", distribution)
+	default:
+		return nil, fmt.Errorf("unrecognized distribution %q", distribution)
 	}
 
 	if bc.ic.Contents.BaseImage != nil {
@@ -69,8 +83,16 @@ func (bc *Context) buildLayers(ctx context.Context) ([]v1.Layer, error) {
 		return nil, err
 	}
 
-	// Use our layering strategy to partition packages into a set of Budget groups.
-	groups, err := groupByOriginAndSize(pkgs, bc.ic.Layering.Budget)
+	// Use layering strategy to partition packages into a set of Budget groups.
+	var groups []*group
+	switch strategy {
+	case "origin":
+		groups, err = groupByOriginAndSize(pkgs, bc.ic.Layering.Budget, distribution)
+	case "vendored":
+		groups, err = groupByVendored(bc.fs, bc.ic.Layering.Budget, distribution)
+	default:
+		return nil, fmt.Errorf("unrecognized layering strategy %q", strategy)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("grouping packages: %w", err)
 	}
@@ -78,7 +100,9 @@ func (bc *Context) buildLayers(ctx context.Context) ([]v1.Layer, error) {
 
 	for i, g := range groups {
 		log.Infof("  layer[%d]:", i)
-
+		for _, p := range g.paths {
+			log.Infof("    ~ %s", p)
+		}
 		for _, pkg := range g.pkgs {
 			log.Infof("    - %s=%s", pkg.Name, pkg.Version)
 		}
@@ -88,154 +112,21 @@ func (bc *Context) buildLayers(ctx context.Context) ([]v1.Layer, error) {
 	return splitLayers(ctx, bc.fs, groups, pkgToDiff, bc.o.TempDir())
 }
 
-func replacesGroup(rep string, g *group) (bool, error) {
-	constraint := apk.ResolvePackageNameVersionPin(rep)
-
-	// Look for the package to make sure the version satisfies Replaces.
-	for _, pkg := range g.pkgs {
-		if pkg.Name != constraint.Name {
-			// This is not the package we're looking for.
-			continue
-		}
-
-		ver, err := apk.ParseVersion(pkg.Version)
-		if err != nil {
-			return false, fmt.Errorf("parsing %s version %s: %w", pkg.Name, pkg.Version, err)
-		}
-
-		ok, err := constraint.SatisfiedBy(ver)
-		if err != nil {
-			return false, fmt.Errorf("checking %s satisfies %s: %w", pkg.Version, constraint.Name, err)
-		}
-
-		if ok {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-func groupByOriginAndSize(pkgs []*apk.Package, budget int) ([]*group, error) {
-	// First, we're going to group packages by their origin.
-	byOrigin := map[string]*group{}
-	for _, pkg := range pkgs {
-		origin := pkg.Origin
-		if _, ok := byOrigin[origin]; !ok {
-			byOrigin[origin] = &group{}
-		}
-
-		g, ok := byOrigin[origin]
-		if !ok {
-			panic(fmt.Errorf("byOrigin[%q] missing", origin))
-		}
-
-		g.pkgs = append(g.pkgs, pkg)
-	}
-
-	// Then we need to merge any packages that replace each other.
-	byPackage := map[string]*group{}
-	for _, g := range byOrigin {
-		for _, pkg := range g.pkgs {
-			byPackage[pkg.Name] = g
-		}
-	}
-
-	replaceMap := map[string][]string{}
-	for _, g := range byPackage {
-		for _, pkg := range g.pkgs {
-			if len(pkg.Replaces) == 0 {
-				continue
-			}
-
-			replaceMap[pkg.Name] = pkg.Replaces
-		}
-	}
-
-	for pkg, replaces := range replaceMap {
-		for _, rep := range replaces {
-			constraint := apk.ResolvePackageNameVersionPin(rep)
-
-			replacee, ok := byPackage[constraint.Name]
-			if !ok {
-				// Whatever this package replaces is not in the image, that's normal.
-				continue
-			}
-
-			if ok, err := replacesGroup(rep, replacee); err != nil {
-				return nil, fmt.Errorf("checking %s replaces %s: %w", pkg, constraint.Name, err)
-			} else if !ok {
-				continue
-			}
-
-			g, ok := byPackage[pkg]
-			if !ok {
-				panic(fmt.Errorf("byPackage[%q] missing", pkg))
-			}
-
-			// If they're already merged, nothing to do.
-			if replacee == g {
-				continue
-			}
-
-			// Otherwise, we need to merge the two groups.
-			merged := merge(g, replacee)
-
-			// Update our maps so we can test identity above.
-			for _, pkg := range merged.pkgs {
-				byPackage[pkg.Name] = merged
-				byOrigin[pkg.Origin] = merged
-			}
-		}
-	}
-
-	// Now we need to pick the best groups to keep.
-	// First pass we'll set the size of each group to the sum of the installed size of all its packages.
-	groups := make([]*group, 0, budget)
-	seen := map[*group]struct{}{}
-	for v := range maps.Values(byOrigin) {
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
-		groups = append(groups, v)
-	}
-	for _, g := range groups {
-		for _, pkg := range g.pkgs {
-			g.size += pkg.InstalledSize
-			g.tiebreaker = max(g.tiebreaker, pkg.Name)
-		}
-	}
-
-	// Then we'll sort by the size and take the top $budget, merging the remainders.
-	slices.SortFunc(groups, func(a, b *group) int {
-		return cmp.Or(
-			cmp.Compare(b.size, a.size),             // Descending size.
-			cmp.Compare(a.tiebreaker, b.tiebreaker)) // In the rare case where we have identical sizes.
-	})
-
-	if len(groups) > budget {
-		cutoff := max(budget-1, 0) // Even if budget == 0, we want 1 group.
-
-		remainder := groups[cutoff:]
-		groups = groups[:cutoff]
-
-		groups = append(groups, merge(remainder...))
-	}
-
-	// Sort packages too just so they're in a consistent order.
-	for _, g := range groups {
-		slices.SortFunc(g.pkgs, func(a, b *apk.Package) int {
-			return cmp.Compare(a.Name, b.Name)
-		})
-	}
-
-	return groups, nil
-}
-
+// For the origin strategy, groups reflect packages grouped by origin
+// For the vendored strategy, groups reflect vendored packages written to the
+// same layer. The layer assigned is computed by the hash of the first path
+// read from package metadata
 type group struct {
+	// Packages grouped together. In the vendored strategy, these packages own
+	// the paths being written to the layer
 	pkgs []*apk.Package
 
+	// Paths to write to layer... Used by the vendored strategy. I'm not
+	// crazy about this. There's room for a better abstraction that actually
+	// reflects contents of each vendored eocsystem package
+	paths []string
+
+	// Group size
 	size uint64
 
 	// This is silly but in the event that two groups have identical size,
@@ -246,18 +137,73 @@ type group struct {
 func merge(groups ...*group) *group {
 	merged := &group{}
 	for _, g := range groups {
-		merged.pkgs = slices.Concat(merged.pkgs, g.pkgs)
+		merged.pkgs = append(merged.pkgs, g.pkgs...)
+		merged.paths = append(merged.paths, g.paths...)
 		merged.size += g.size
 		merged.tiebreaker = max(merged.tiebreaker, g.tiebreaker)
 	}
 	return merged
 }
 
+func hashToLayer(key string, budget int) uint32 {
+	h := fnv.New32a()
+	io.WriteString(h, key)
+	return h.Sum32() % uint32(budget)
+}
+
+// assignGroups distributes groups across layers using the given distribution.
+//
+// "stable" uses hash partitioning so that adding or removing a group does not
+// change the layer assignment of other groups.
+//
+// "balanced" sorts groups by size descending, keeps the top budget-1 groups
+// as their own layers, and merges the remainder into one.
+func assignGroups(groups []*group, budget int, distribution string) ([]*group, error) {
+	switch distribution {
+	case "stable":
+		layers := make([]*group, budget)
+		for _, g := range groups {
+			i := hashToLayer(g.tiebreaker, budget)
+			if layers[i] == nil {
+				layers[i] = g
+			} else {
+				layers[i] = merge(layers[i], g)
+			}
+		}
+
+		for i, l := range layers {
+			if l == nil {
+				return nil, fmt.Errorf("layer %d is empty; decrease the budget (%d)", i, budget)
+			}
+		}
+		return layers, nil
+
+	default: // balanced
+		slices.SortFunc(groups, func(a, b *group) int {
+			return cmp.Or(
+				cmp.Compare(b.size, a.size),             // Descending size.
+				cmp.Compare(a.tiebreaker, b.tiebreaker)) // In the rare case where we have identical sizes.
+		})
+
+		if len(groups) > budget {
+			cutoff := max(budget-1, 0) // Even if budget == 0, we want 1 group.
+
+			remainder := groups[cutoff:]
+			groups = groups[:cutoff]
+
+			groups = append(groups, merge(remainder...))
+		}
+
+		return groups, nil
+	}
+}
+
 func splitLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToDiff map[*apk.Package][]byte, tmpdir string) ([]v1.Layer, error) {
 	buf := make([]byte, 1<<20)
 
-	// We'll create a writer for each layer and a map to quickly access the writer given a package or group.
+	// We'll create a writer for each layer and maps to quickly route files.
 	packageToWriter := map[string]*layerWriter{}
+	pathToWriter := map[string]*layerWriter{}
 	groupToWriter := map[*group]*layerWriter{}
 
 	for _, g := range groups {
@@ -269,9 +215,11 @@ func splitLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToD
 
 		w := newLayerWriter(f)
 		groupToWriter[g] = w
-
 		for _, pkg := range g.pkgs {
 			packageToWriter[pkg.Name] = w
+		}
+		for _, p := range g.paths {
+			pathToWriter[p] = w
 		}
 	}
 
@@ -320,11 +268,18 @@ func splitLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToD
 			Package() *apk.Package
 		}); ok {
 			if pkg := pkger.Package(); pkg != nil {
-				w, ok = packageToWriter[pkg.Name]
-				if !ok {
-					panic(fmt.Errorf("packageToWriter[%q] missing", pkg.Name))
+				// Route to this package's origin layer if one exists.
+				if pw, ok := packageToWriter[pkg.Name]; ok {
+					w = pw
 				}
 			}
+		}
+
+		// Check if this file's path matches a vendored package path,
+		// and if so route it to that group's layer. This overrides
+		// package ownership routing.
+		if pw, ok := pathToWriter[f.path]; ok {
+			w = pw
 		}
 
 		// As described above, bring the layer's stack up to date with the main stack.
@@ -397,6 +352,10 @@ func splitLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToD
 					if _, err := buf.Write(pkgToDiff[pkg]); err != nil {
 						return nil, err
 					}
+				}
+
+				if buf.Len() == 0 {
+					continue
 				}
 
 				// Only the size should be different across layers.

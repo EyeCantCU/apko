@@ -253,6 +253,11 @@
         },
         "budget": {
           "type": "integer"
+        },
+        "distribution": {
+          "type": "string",
+          "enum": ["balanced", "stable"],
+          "default": "balanced"
         }
       },
       "additionalProperties": false,
